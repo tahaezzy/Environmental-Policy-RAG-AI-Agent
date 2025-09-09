@@ -1,4 +1,15 @@
-## VERSION 4.3
+## BETA VERSION 4.4
+# Changes:
+# Removed functionality for adding single document to make the data base rely on the policy docs folder only. Reduces error caused by user. 
+# Fixed hybrid chunking to revert bacck to header-based style
+# Revamped hybrid_chunking by addding cross-encoder to maximise re-ranking with BMRank25. 
+# Added user query refining to improve LLM understanding (Currently Unstable).
+# Refined system prompt to porvide better answers using CoT prompting for generic queries.
+# Started building compliance section.
+# Switched LLM model to quantized Qwen 3 (0.6B) 4-bit thinking model (qwen3:0.6b-q4_K_M). -> Back to qwen2.5:0.5b due to thinking errors.
+# Set context length to 32k tokens for Qwen 3. Added model thinking mode. Set to False to reduce overhead during testing. 
+# Added additional comments. Fixed function headers. Minor text tweaks. Minor cleaning. 
+
 import os
 import json
 import hashlib
@@ -16,7 +27,16 @@ from pdf2image import convert_from_path
 from PIL import Image
 from chromadb import Client as ChromaClient
 from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder 
 from ollama import Client as OllamaClient
+cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+# Constants
+LLM_MODEL_NAME = "qwen2.5:0.5b"
+BATCH_SIZE = 32
+MAX_TOKENS_PER_CHUNK = 512
+CONTEXT_WINDOW_LENGTH = 32000
+THINK_MODE = True
 
 # Validate Tesseract path
 TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Adjust if different
@@ -29,18 +49,13 @@ scripts_path = r'C:\Users\tahae\AppData\Local\Packages\PythonSoftwareFoundation.
 os.environ['PATH'] = scripts_path + os.pathsep + os.environ.get('PATH', '')
 
 # Setup logging
-logging.basicConfig(filename='greenpolicy.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Constants
-BATCH_SIZE = 32
-MAX_TOKENS_PER_CHUNK = 500
+logging.basicConfig(filename='GreenPolicyAI.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Model Initialization
 llm = OllamaClient()
 embed_model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda' if torch.cuda.is_available() else 'cpu')
 client = ChromaClient()
 collection = client.get_or_create_collection("policies")
-examplepolicies = "examplepolicy_docs.txt"
 
 # Paths and Cache
 doc_folder = "example_policy_docs"
@@ -97,7 +112,16 @@ def chunk_text(text: str, max_tokens: int = MAX_TOKENS_PER_CHUNK) -> list:
     return chunks
 
 def hybrid_chunking(text: str, max_tokens_per_chunk: int = MAX_TOKENS_PER_CHUNK) -> list:
-    """Hybrid chunking: headers until max_tokens, then token-based."""
+    """
+    Perform hybrid chunking: header-based merge until max_tokens, then token-based splitting, resetting to header mode after.
+    
+    Args:
+        text: Full document text.
+        max_tokens_per_chunk: Maximum tokens allowed per chunk.
+    
+    Returns:
+        List[dict]: List of chunks with 'text' and 'headers' keys.
+    """
     sections = split_headers(text)
     chunks = []
     current_chunk_text = ""
@@ -108,26 +132,32 @@ def hybrid_chunking(text: str, max_tokens_per_chunk: int = MAX_TOKENS_PER_CHUNK)
         if not sec_text:
             continue
         sec_tokens = len(sec_text.split())
+
+        # Try to merge with current
         if current_tokens + sec_tokens <= max_tokens_per_chunk:
             current_chunk_text += sec_text + "\n\n"
             current_headers.append(sec["header"])
             current_tokens += sec_tokens
         else:
+            # Commit current chunk if any
             if current_chunk_text:
                 chunks.append({"text": current_chunk_text.strip(), "headers": current_headers})
+
+            # Handle oversized section with token splitting
             if sec_tokens > max_tokens_per_chunk:
                 token_chunks = chunk_text(sec_text, max_tokens=max_tokens_per_chunk)
                 for t_chunk in token_chunks:
                     chunks.append({"text": t_chunk, "headers": [sec["header"]]})
-                current_chunk_text = ""
-                current_headers = []
-                current_tokens = 0
+            # Start new merge cycle
             else:
-                current_chunk_text = sec_text
+                current_chunk_text = sec_text + "\n\n"
                 current_headers = [sec["header"]]
                 current_tokens = sec_tokens
+
+    # Commit final chunk            
     if current_chunk_text:
         chunks.append({"text": current_chunk_text.strip(), "headers": current_headers})
+
     return chunks
 
 def get_batch_embeddings(texts: list[str], batch_size: int = BATCH_SIZE) -> list[list[float]]:
@@ -261,6 +291,7 @@ else:
     save_cache()
     print(f"Policy documents ingested successfully! Collection size: {collection.count()}")
 
+'''
 def add_document(text: str, doc_id: str, source=examplepolicies) -> None:
     """Add a single document to Chroma."""
     try:
@@ -274,89 +305,209 @@ def add_document(text: str, doc_id: str, source=examplepolicies) -> None:
         save_cache()
     except Exception as e:
         logging.error(f"Error adding document {doc_id}: {e}")
+'''
 
-def ask_rag(query: str, model_name="qwen2.5:0.5b", top_k=4):
-    """Query RAG with hybrid retrieval."""
+def ask_rag(query: str, model_name=LLM_MODEL_NAME, top_k=5):
+    """
+    Refine the user query, query the RAG system with hybrid retrieval (dense + BM25)
+    and cross-encoder re-ranking. 
+    
+    Args:
+        query: User question.
+        model_name: LLM model name to query.
+        top_k: Number of top chunks to retrieve from Chroma.
+    
+    Returns:
+        Tuple[ollama.Message, list]: LLM response and metadata of retrieved chunks.
+    """
 
-    ##############################################################################################
-    # Default model priority list (Keep Updating with latest pullable free models)
-    ## Build cycle system to test different models. 
-    #if model_name is None:
-    #    models_to_try = ["llama3.2", "llama3.1", "llama3", "phi3", "mistral", "codellama"]
-    #else:
-    #    models_to_try = [model_name]
-    ##############################################################################################
+    
+# Potential Future Update in ask_rag:
+############################################################################################################################
+# Default model priority list (Keep Updating with latest pullable free models) -> Future functionality for larger use cases.
+# Build cycle system to test different models. 
+# #if model_name is None:
+#    models_to_try = ["llama3.2", "llama3.1", "llama3", "phi3", "mistral", "codellama"]
+#else:
+#    models_to_try = [model_name]
+############################################################################################################################
 
     try:
+        # Check if collection is empty
         if collection.count() == 0:
             logging.error("Chroma collection is empty")
             return None, None
         
-        query_emb = embed_model.encode(query)
         
-        # Fix: Include embeddings in the query results
+        '''Note: Query refinement process -> Unstable as it either crashes or times out. Most likely due to insufficient compute. Need to fix.
+        # Refine query for better understanding with error handling
+        refined_query = query  # Fallback to original query
+        try:
+            refinement_response = llm.chat(model="qwen3:0.6b-q4_K_M", messages=[
+                {"role": "system", "content": "Refine this query for clarity, specificity, and deeper understanding."},
+                {"role": "user", "content": f"Query: {query}"}
+            ])
+            
+            # Safe access to response content
+            if refinement_response and hasattr(refinement_response, 'message') and refinement_response.message:
+                if hasattr(refinement_response.message, 'content') and refinement_response.message.content:
+                    refined_query = refinement_response.message.content.strip()
+                    logging.info(f"Query refined from '{query}' to '{refined_query}'")
+                else:
+                    logging.warning("Query refinement returned no content, using original query")
+            else:
+                logging.warning("Query refinement failed, using original query")
+        except Exception as refinement_error:
+            logging.warning(f"Query refinement failed: {refinement_error}, using original query")
+        '''
+
+        # Hybrid Retrieval
+        query_emb = embed_model.encode(query)
         results = collection.query(
             query_embeddings=[query_emb], 
-            n_results=top_k * 2,
-            include=['documents', 'metadatas', 'embeddings', 'distances']  # Explicitly request embeddings
+            n_results=top_k * 2,  # Get extra for re-rank
+            include=['documents', 'metadatas', 'embeddings', 'distances']
         )
         
-        logging.info(f"Query results: {results}")
-        
+        # Check if we got valid results
         if not results['documents'] or not results['documents'][0]:
             logging.error("No documents retrieved from Chroma")
             return None, None
         
-        # Fix: Check if embeddings exist before using them
         if not results['embeddings'] or len(results['embeddings']) == 0 or len(results['embeddings'][0]) == 0:
             logging.error("No embeddings retrieved from Chroma")
-            # Fallback to just using BM25 scoring
+            # Fallback to BM25 only
             tokenized_docs = [doc.split() for doc in results['documents'][0]]
             bm25 = BM25Okapi(tokenized_docs)
             bm25_scores = bm25.get_scores(query.split())
             top_indices = np.argsort(bm25_scores)[::-1][:top_k]
+            final_docs = [results['documents'][0][i] for i in top_indices]
         else:
-            # Use hybrid scoring as intended
-            retrieved_embs = results['embeddings'][0]  # Already a numpy array
+            # Compute dense similarities (cosine)
+            retrieved_embs = results['embeddings'][0]
             if not isinstance(retrieved_embs, np.ndarray):
                 retrieved_embs = np.array(retrieved_embs)
                 
             dense_scores = np.dot(retrieved_embs, query_emb) / (np.linalg.norm(retrieved_embs, axis=1) * np.linalg.norm(query_emb))
             
+            # BM25 on retrieved docs
             tokenized_docs = [doc.split() for doc in results['documents'][0]]
             bm25 = BM25Okapi(tokenized_docs)
             bm25_scores = bm25.get_scores(query.split())
             
+            # Hybrid fusion: 0.7 dense + 0.3 BM25
             combined_scores = 0.7 * dense_scores + 0.3 * bm25_scores
-            top_indices = np.argsort(combined_scores)[::-1][:top_k]
+            
+            # Sort by hybrid, take top 2*top_k for cross-encoder
+            pre_top_indices = np.argsort(combined_scores)[::-1][:top_k * 2]
+            
+            # Cross-encoder re-ranking on pre-top
+            pre_top_docs = [results['documents'][0][i] for i in pre_top_indices]
+            pairs = [[query, doc] for doc in pre_top_docs]
+            ce_scores = cross_encoder.predict(pairs)
+            
+            # Final top_k by cross-encoder scores
+            top_indices = np.argsort(ce_scores)[::-1][:top_k]
+            final_docs = [pre_top_docs[i] for i in top_indices]
+            # Get original indices for metadata
+            original_indices = [pre_top_indices[i] for i in top_indices]
         
-        context = " ".join([results['documents'][0][i] for i in top_indices])
-        metadata = [results['metadatas'][0][i] for i in top_indices] if 'metadatas' in results and results['metadatas'] else None
+        context = " ".join(final_docs)
         
-        # Load model if not already loaded
+        # Safe metadata access
+        metadata = None
+        if 'metadatas' in results and results['metadatas'] and results['metadatas'][0]:
+            if 'original_indices' in locals():
+                metadata = [results['metadatas'][0][i] for i in original_indices]
+            else:
+                metadata = [results['metadatas'][0][i] for i in top_indices]
+        
+        # Pre-load dummy if first run
         if not hasattr(ask_rag, "loaded"):
-            llm.chat(model=model_name, messages=[{"role": "user", "content": "Test."}])
-            ask_rag.loaded = True
-        
+            try:
+                llm.chat(model=model_name, messages=[{"role": "user", "content": "Test."}])
+                ask_rag.loaded = True
+            except Exception as e:
+                logging.warning(f"Model pre-loading failed: {e}")
+
+        # Main query with error handling
         response = llm.chat(model=model_name, messages=[
-            {"role": "system", "content": "You are an expert environmental policy assistant. Assist using 2025 data."},
-            {"role": "user", "content": f"Answer based on context: {context}\nQuestion: {query}"}
-        ])
+            {"role": "system", "content": 
+             "You are an expert environmental policy assistant. Assist the user with their query using information relevant to the \
+             most up-to-date year. Respond in natural, flowing sentences (no bullet points unless asked). Think step by step: 1. Identify\
+             the over-arching meaning of the question. What is the user asking about or wish to achieve? How can it be accomplished thoroughly?\
+             Identify any relevant policy rules and/or information. 2. Using the retrieved information, apply it to the problem identified in the\
+             query and prepare the answer. 3. Revise the solution to see if it meets the needs of the user. Identify potential methods to improve\
+             the answer, and refine the final response using the methodology. 4. Respond clearly to the user, identifying the sources of information\
+             used when possible. 5. Finally, ask for any additional steps you should perform. 6. Generate the final response."},
+            {"role": "user", "content": f"Answer the question based on the following context: {context}\nQuestion: {query}"}
+        ],
+        options={
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "repeat_penalty": 1.1,
+            "enable_thinking": THINK_MODE
+        })
         
-        return response.message, metadata
+        return response, metadata
         
     except Exception as e:
         logging.error(f"Error in RAG query: {e}")
         return None, None
+    
+def pdf_spliter(user_pdf):
+    print("Work in progress")
 
-def check_compliance(project_desc: str, query: str = "Does this project violate any rules?"):
-    """Compliance checker with RAG."""
-    full_query = f"Project: {project_desc}. {query}"
-    return ask_rag(full_query)
 
-# REPL
-print("GreenPolicyAI REPL. Type 'exit' to quit.")
-print("For compliance check, prefix with 'compliance:' (e.g., 'compliance: Build factory near wetland').")
+'''
+### WORK IN PROGRESS
+def check_compliance(user_query, user_project_pdf):
+    """Compliance checker with RAG.
+    
+    Args:
+        user_query: Original user query.
+    
+    Returns:
+        ask_rag(newl_query): The LLM's response to full_query (Engineered prompt + original user query).
+    """
+    pdf_sections = pdf_splitter(user_project_pdf)
+    compliance_engineered_prompt = "Perform a compliance check by going ther"
+
+    new_query = compliance_engineered_prompt + user_query
+
+    return ask_rag(new_query)
+    # Fresh prompt each time—no history
+    prompt = f"""
+    You are a regulatory compliance expert for GIS/environmental projects.
+    Focus EXCLUSIVELY on the following project section. Ignore any other parts of the project.
+    
+    Project Section: {section_text}
+    
+    Relevant Regulations: {rag_regs}  # RAG-retrieved chunks for this section
+    
+    Analyze line-by-line for non-compliance. Flag issues with evidence from this section only.
+    Output: JSON list of flags, e.g., [{{"issue": "desc", "evidence": "quote from section", "reg_ref": "from RAG"}}]
+    """
+    
+    response = ollama.chat(model=model_name, messages=[{'role': 'user', 'content': prompt}])
+    # Note: ollama.chat() here is stateless unless you add 'options' with history—don't.
+    return response['message']['content']
+
+# In your main loop:
+sections = split_pdf_into_sections(pdf_path)  # Your PDF splitter
+all_flags = []
+for i, section in enumerate(sections):
+    # Retrieve RAG regs specific to this section (e.g., query vector DB with section summary)
+    rag_regs = retrieve_relevant_regs(section_summary)  # Your RAG function
+    flags = check_compliance_for_section(section['text'], rag_regs)
+    all_flags.append(flags)
+
+### WORK IN PROGRESS
+'''
+# Program REPL
+print("Welcome to GreenPolicyAI. How can I help you? \n To end the program, type 'exit' or 'quit'.")
+print("To perform a policy compliance check, prefix with 'compliance:' (e.g., 'compliance: Residential emissions above 1 metric ton of carbon').")
 while True:
     user_input = input("Question: ")
     if user_input.lower() in ["exit", "quit"]:
@@ -364,14 +515,14 @@ while True:
     try:
         if user_input.lower().startswith("compliance:"):
             project_desc = user_input[11:].strip()
-            answer, meta = check_compliance(project_desc)
+            answer, meta = 0 #check_compliance(project_desc)
         else:
             answer, meta = ask_rag(user_input)
         if answer:
-            print("Answer:", answer.content)
+            print("Answer:", answer)
             print("Sources:", meta)
         else:
-            print("Error occurred—check greenpolicy.log.")
+            print("An error occurred-please check GreenPolicyAI.log.")
     except Exception as e:
         logging.error(f"REPL error: {e}")
-        print("Error—check log.")
+        print("An error occurred-please check GreenPolicyAI.log.")
