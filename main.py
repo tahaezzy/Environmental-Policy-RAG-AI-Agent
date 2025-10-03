@@ -1,7 +1,8 @@
-## BETA VERSION 4.5.1
+## BETA VERSION 5
 # Changes:
 '''
--  Integrated Graph Knowledge Base for improved regulations traversing (better literal and overall context)
+-  Fully implemented project compliance checker against regulations. 
+- Integrated Graph Knowledge Base for improved regulations traversing (better literal and overall context)
 using NetworkX (in-memory) and FAISS (hybrid vector-graph retrieval) instead of only regular RAG. 
 - Implemented Rule-based extraction with spaCy + regex for entities/relations (no extra LLM calls for efficiency).
 - Adapted build_reg_graph to use "Regulations Folder" and parse PDFs for extraction
@@ -41,9 +42,21 @@ from pathlib import Path  # For cache path
 import psutil
 import pickle
 import asyncio
+import gc
 import time
 import sqlite3
 from typing import List, Dict, Any, Optional, Tuple
+import matplotlib.pyplot as plt
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+    handlers=[
+        logging.FileHandler('GreenPolicyAI.log', mode='a'),
+        logging.StreamHandler()
+    ]
+)
 
 # Load Required DEPENDENCIES. 
 try:
@@ -97,17 +110,6 @@ else:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
     logging.info("Tesseract configured successfully")
 
-
-# Enhanced logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-    handlers=[
-        logging.FileHandler('GreenPolicyAI.log', mode='a'),
-        logging.StreamHandler()
-    ]
-)
-
 # Model Initialization
 try:
     llm = OllamaClient()
@@ -133,7 +135,7 @@ def get_system_constants():
     else:
         return {'BATCH_SIZE': 64, 'MAX_TOKENS': 1024, 'CONTEXT_LEN': 32768, 'TOP_K': 5}
 
-# Constants
+# @ Constants
 constants = get_system_constants()
 LLM_MODEL_NAME = "qwen2.5:0.5b"
 BATCH_SIZE = constants['BATCH_SIZE']
@@ -142,16 +144,17 @@ CONTEXT_WINDOW_LENGTH = constants['CONTEXT_LEN']
 TOP_K_DEFAULT = constants['TOP_K']
 THINK_MODE = False
 
-# Paths and Cache
+# @ Paths and Cache
 knowledge_base_folder = "Knowledge Base Folder"
 project_guidelines_folder = "Project Guidlines Folder"
-compliance_regulations_folder = "Compliance Regulations Folder"
+compliance_regulations_folder = "Regulations Folder"
+
+cache_file = "embedding_cache.json"
 DB_PATH = "greenpolicy.db"
 FAISS_INDEX_PATH = "faiss_index.bin"
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 REDIS_DB = 0
-cache_file = "embedding_cache.json"
 GRAPH_CACHE = "reg_graph.pkl"  # Graph persistence
 
 
@@ -469,7 +472,6 @@ def check_memory_usage() -> bool:
 
 def memory_cleanup():
     """Perform memory cleanup"""
-    import gc
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -670,173 +672,353 @@ def extract_pdf_text(file_path: str, password: str = None) -> str:
         logging.error(f"Error processing PDF {file_path}: {e}")
     return text
 
-# @ COMPLIANCE FUNCTIONS
-
-def extract_entities_relations(markdown):
-    """Rule-based extraction: Entities (rules/entities) and relations from regs MD.
-
-    Uses spaCy NER (ORG/GPE for regs/locations; custom for rule IDs) + dependency parse
-    + regex patterns for relations (e.g., 'requires', 'as per', 'overrides').
-    Efficient: No LLM; ~90% accuracy on structured regs.
-    Returns triples: [{'head': 'Reg101', 'relation': 'requires', 'tail': 'Buffer50m', 'evidence': 'text span'}]
-
-    Args:
-        markdown (str): Parsed regs MD.
-
-    Returns:
-        List[Dict[str, Any]]: Extracted triples.
+def extract_facts_to_json(text: str, source: str = "guideline") -> List[Dict[str, Any]]:
     """
-    doc = nlp(markdown)
-    triples = []
+    Extracts structured facts (quantities, obligations, limits) from free text using regex.
+    
+    Args:
+        text (str): Raw guideline/regulation chunk.
+        source (str): 'guideline' or 'regulation' (used for tagging).
+    
+    Returns:
+        List[Dict[str, Any]]: Structured facts as JSON-like dicts.
+    """
+    facts = []
 
-    # Entity extraction: Rule IDs (regex) + NER
-    rule_entities = re.findall(r'(Reg|Section|Rule)\s*(\d+[A-Z]?)', markdown, re.IGNORECASE)
-    entities = {f"{match[0]}{match[1]}": match[0] for match in rule_entities}  # e.g., 'Reg101'
+    if not text or not text.strip():
+        return facts
 
-    # Relations via patterns (simple dependency + keywords)
-    relation_patterns = {
-        'requires': ['requires', 'must comply with'],
-        'depends_on': ['as defined in', 'per', 'see'],
-        'overrides': ['except', 'notwithstanding', 'supersedes']
+    # Pattern for numeric constraints like "85 tomatoes", "200 liters", "5 km"
+    num_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*([a-zA-Z]+(?:s)?)')
+
+    # Obligation words
+    obligations = {
+        "must": "mandatory",
+        "shall": "mandatory",
+        "should": "recommended",
+        "may": "permitted",
+        "must not": "prohibited",
+        "shall not": "prohibited",
+        "may not": "prohibited"
     }
 
-    for sent in doc.sents:
-        for token in sent:
-            if token.dep_ == 'ROOT' and token.lemma_ in ['require', 'comply', 'override']:  # Verb roots
-                # Find entities in sentence
-                sent_entities = [ent.text for ent in sent.ents if ent.label_ in ['ORG', 'GPE']] + \
-                                [m.group() for m in re.finditer(r'(Reg|Section)\s*\d+', sent.text)]
-                if len(sent_entities) >= 2:
-                    head, tail = sent_entities[0], sent_entities[1]  # Simplistic; refine with POS
-                    rel_type = next((k for k, v in relation_patterns.items() if any(p in sent.text.lower() for p in v)), 'applies_to')
-                    triples.append({
-                        'head': head,
-                        'relation': rel_type,
-                        'tail': tail,
-                        'evidence': sent.text.strip()
-                    })
+    # Scan for numeric constraints
+    for match in num_pattern.finditer(text):
+        quantity, unit = match.groups()
+        facts.append({
+            "type": "constraint",
+            "source": source,
+            "quantity": float(quantity),
+            "unit": unit.lower(),
+            "context": text[max(0, match.start()-40):match.end()+40].strip()
+        })
 
-    # Dedup and filter
-    unique_triples = {f"{t['head']}-{t['relation']}-{t['tail']}": t for t in triples}.values()
-    return list(unique_triples)
+    # Scan for obligations
+    for word, label in obligations.items():
+        if re.search(rf"\b{re.escape(word)}\b", text, re.IGNORECASE):
+            facts.append({
+                "type": "obligation",
+                "source": source,
+                "obligation": label,
+                "matched_word": word,
+                "context": text[:200]  # snippet
+            })
 
-def build_reg_graph(regs_folder: str = knowledge_base_folder, rebuild: bool = False) -> None:
-    """Builds the regulations graph and FAISS index once.
+    return facts
 
-    Parses all PDFs in folder to MD, extracts per-doc, aggregates into NetworkX DiGraph.
-    Embeds node texts, indexes in FAISS (inner product for cosine sim).
-    Caches to JSON: Graph as node_link_data dict, embeddings as list of lists (reconstruct index on load).
+# @COMPLIANCE FUNCTIONS
 
-    Args:
-        regs_folder (str): Folder with reg PDFs.
-        rebuild (bool): Force rebuild (ignores cache).
+# Add a new global for stable node ordering / text map
+node_id_order = []        # list[str] -> maps FAISS index -> node id
+node_id_to_text = {}      # dict[node_id] -> text (for safe lookup)
+
+def extract_entities_relations(markdown: str) -> List[Dict[str, Any]]:
     """
-    global reg_graph, faiss_index, node_texts
+    Robust rule-based extraction of entities (rule IDs, section ids, object mentions)
+    and relations from regulation markdown/text.
+
+    Input:
+        markdown: full text for a regulation doc (str)
+
+    Output:
+        List of triples:
+        [
+          {
+            "head": "Reg101",
+            "relation": "requires" | "depends_on" | "overrides" | "applies_to" | "prohibits",
+            "tail": "Buffer50m" or "Reg102",
+            "evidence": "sentence text containing the relation"
+          },
+          ...
+        ]
+    """
+    triples = []
+    if not markdown or not markdown.strip():
+        return triples
+
+    # canonical rule-id regex: supports "Reg 101", "Section 3.4", "Rule12A", etc.
+    rule_id_pattern = re.compile(r'\b(?:Reg|Section|Rule)\s*\d+(?:\.\d+)?[A-Z]?\b', flags=re.IGNORECASE)
+    rule_ids_found = set([m.group(0).replace(" ", "") for m in rule_id_pattern.finditer(markdown)])
+
+    # Relation keyword groups
+    relation_patterns = {
+        'requires': ['requires', 'require', 'must', 'shall', 'must comply', 'shall comply', 'required'],
+        'depends_on': ['as defined in', 'per', 'see', 'refer to', 'according to'],
+        'overrides': ['except', 'notwithstanding', 'supersedes', 'override'],
+        'prohibits': ['prohibit', 'forbid', 'must not', 'may not', 'not permitted']
+    }
+
+    # lower-case text for quick keyword checks
+    lower_text = markdown.lower()
+
+    # Use spaCy for sentence splitting and noun-chunk extraction
+    doc = nlp(markdown)
+    for sent in doc.sents:
+        sent_text = sent.text.strip()
+        if not sent_text:
+            continue
+
+        # find rule ids in the sentence (normalized without spaces)
+        sent_rule_ids = [m.group(0).replace(" ", "") for m in rule_id_pattern.finditer(sent_text)]
+
+        # find simple named entities (ORG/GPE etc) and noun_chunks as fallback
+        ent_texts = [ent.text for ent in sent.ents if ent.text.strip()]
+        noun_chunks = [nc.text for nc in sent.noun_chunks if nc.text.strip()]
+
+        # determine relation type by keywords (first match)
+        rel_type = 'applies_to'
+        st_low = sent_text.lower()
+        for name, keywords in relation_patterns.items():
+            if any(k in st_low for k in keywords):
+                rel_type = name
+                break
+
+        # if we have 2+ rule ids, make a direct triple between them
+        if len(sent_rule_ids) >= 2:
+            head, tail = sent_rule_ids[0], sent_rule_ids[1]
+            triples.append({'head': head, 'relation': rel_type, 'tail': tail, 'evidence': sent_text})
+            continue
+
+        # if one rule id + other phrase, attach rule -> phrase
+        if len(sent_rule_ids) == 1:
+            head = sent_rule_ids[0]
+            # look for other rule-like ids in sentence (already none), else fallback to a noun_chunk/entity
+            tail = None
+            if len(ent_texts) >= 1:
+                tail = ent_texts[0]
+            elif len(noun_chunks) >= 1:
+                # pick a short noun chunk that isn't the rule id itself
+                for nc in noun_chunks:
+                    if nc.replace(" ", "") != head and len(nc) < 120:
+                        tail = nc
+                        break
+            else:
+                # fallback: attempt to capture "Buffer 50m" or numeric+unit patterns
+                m = re.search(r'\b(buffer|setback|zone)\b[^.]{0,80}', sent_text, flags=re.IGNORECASE)
+                tail = m.group(0).strip() if m else sent_text[:120]
+
+            if tail:
+                triples.append({'head': head, 'relation': rel_type, 'tail': tail, 'evidence': sent_text})
+            continue
+
+        # no explicit rule ids: attempt to pair two entities/noun-chunks
+        if len(ent_texts) >= 2:
+            head, tail = ent_texts[0], ent_texts[1]
+            triples.append({'head': head, 'relation': rel_type, 'tail': tail, 'evidence': sent_text})
+            continue
+
+        # fallback: use first two noun chunks
+        if len(noun_chunks) >= 2:
+            head, tail = noun_chunks[0], noun_chunks[1]
+            triples.append({'head': head, 'relation': rel_type, 'tail': tail, 'evidence': sent_text})
+            continue
+
+    # deduplicate by head-relation-tail
+    unique = {}
+    for t in triples:
+        key = f"{t['head']}||{t['relation']}||{t['tail']}"
+        if key not in unique:
+            unique[key] = t
+
+    return list(unique.values())
+
+
+def build_reg_graph(regs_folder: str = compliance_regulations_folder, rebuild: bool = False) -> None:
+    """
+    Build or load a regulations graph (NetworkX DiGraph) and FAISS index.
+
+    Inputs:
+        regs_folder: path to PDFs folder
+        rebuild: force rebuild ignoring cache
+
+    Side effects (globals set):
+        reg_graph (nx.DiGraph), faiss_index (faiss index), node_texts (list[str]),
+        node_id_order (list[str]), node_id_to_text (dict)
+    """
+    global reg_graph, faiss_index, node_texts, node_id_order, node_id_to_text
 
     cache_path = Path(GRAPH_CACHE)
+    # Try load cache (must include explicit node_id ordering)
     if cache_path.exists() and not rebuild:
         try:
             with open(cache_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # Reconstruct graph from node_link_data
             reg_graph = nx.node_link_graph(data['graph'])
-            # Reconstruct node_texts
-            node_texts = data['node_texts']
-            # Reconstruct FAISS: Create new index and add cached embeddings
+            node_id_order = data.get('node_ids', list(reg_graph.nodes()))
+            # node_texts array should correspond to node_id_order
+            node_texts = data.get('node_texts', [reg_graph.nodes[n].get('text', '') for n in node_id_order])
             embeddings = np.array(data['embeddings']).astype('float32')
+
+            # Build FAISS index
             dim = embeddings.shape[1]
             faiss_index = faiss.IndexFlatIP(dim)
-            faiss.normalize_L2(embeddings)
-            faiss_index.add(embeddings)
-            print("Loaded graph from JSON cache.")
-            return
-        except (json.JSONDecodeError, KeyError, Exception) as e:
-            logging.warning(f"JSON cache load failed: {e}, rebuilding.")
+            emb_to_add = np.ascontiguousarray(embeddings)
+            faiss.normalize_L2(emb_to_add)
+            faiss_index.add(emb_to_add)
 
-    # Parse all PDFs (reuse extract_pdf_text)
-    reg_markdowns = []
-    pdf_files = [f for f in os.listdir(regs_folder) if f.endswith(".pdf")]
+            # build mapping dict
+            node_id_to_text = {nid: node_texts[i] if i < len(node_texts) else reg_graph.nodes[nid].get('text', '') for i, nid in enumerate(node_id_order)}
+            logging.info("Loaded regulation graph and FAISS index from cache.")
+            return
+        except Exception as e:
+            logging.warning(f"Failed loading graph cache ({e}), rebuilding...")
+
+    # Build from scratch
+    if not os.path.exists(regs_folder):
+        logging.error(f"Regulations folder not found: {regs_folder}")
+        reg_graph = nx.DiGraph()
+        return
+
+    pdf_files = [f for f in os.listdir(regs_folder) if f.lower().endswith(".pdf")]
+    all_triples = []
+    # parse each PDF once, extract triples
     for file_name in pdf_files:
         pdf_path = os.path.join(regs_folder, file_name)
-        md = extract_pdf_text(pdf_path)  # MD-like text
-        triples = extract_entities_relations(md)
-        reg_markdowns.append(md)
+        try:
+            md = extract_pdf_text(pdf_path)
+            triples = extract_entities_relations(md)
+            # optional: attach source info to each triple
+            for t in triples:
+                t.setdefault('source', file_name)
+            all_triples.extend(triples)
+        except Exception as e:
+            logging.warning(f"Failed parse {file_name}: {e}")
 
-    # Build regulations graph: Nodes from unique entities + chunks; edges from triples
+    # Build graph edges/nodes
     reg_graph = nx.DiGraph()
-    all_entities = set()
-    all_triples = []
-    for md in reg_markdowns:
-        triples = extract_entities_relations(md)
-        all_triples.extend(triples)
-        for t in triples:
-            reg_graph.add_edge(t['head'], t['tail'], relation=t['relation'], evidence=t['evidence'])
-            all_entities.update([t['head'], t['tail']])
+    for t in all_triples:
+        h = t['head']
+        ta = t['tail']
+        # add nodes (if not exist) and store a small text snippet
+        if 'text' not in reg_graph.nodes.get(h, {}):
+            reg_graph.add_node(h, text=f"{h}: {t.get('evidence','')[:300]}")
+        if 'text' not in reg_graph.nodes.get(ta, {}):
+            reg_graph.add_node(ta, text=f"{ta}: {t.get('evidence','')[:300]}")
+        # add edge
+        reg_graph.add_edge(h, ta, relation=t.get('relation', 'applies_to'), evidence=t.get('evidence', ''), source=t.get('source'))
 
-    # Add node texts (from evidence/evidence)
-    for node in all_entities:
-        node_text = f"Regulation Node: {node}. " + " ".join([data['evidence'] for _, _, data in reg_graph.in_edges(node, data=True)] + [data['evidence'] for _, _, data in reg_graph.out_edges(node, data=True)])
-        reg_graph.nodes[node]['text'] = node_text[:500]  # Truncate for efficiency
+    if reg_graph.number_of_nodes() == 0:
+        logging.warning("No nodes found in reg_graph after parsing.")
+        node_texts = []
+        node_id_order = []
+        node_id_to_text = {}
+        faiss_index = None
+        return
 
-    # Embed and index
-    node_list = list(reg_graph.nodes(data=True))
-    node_texts = [n[1]['text'] for n in node_list]
-    embeddings = embed_model.encode(node_texts)
-    dim = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatIP(dim)
-    emb_normalized = embeddings.copy()
-    faiss.normalize_L2(emb_normalized)
-    faiss_index.add(emb_normalized.astype('float32'))
+    # Define insertion order and node_texts in that order (stable mapping)
+    node_id_order = list(reg_graph.nodes())  # insertion order is preserved by networkx (>=2.0)
+    node_texts = [reg_graph.nodes[n].get('text', '') for n in node_id_order]
+    node_id_to_text = {nid: node_texts[i] for i, nid in enumerate(node_id_order)}
 
-    # Cache as JSON: Graph dict, node_texts list, embeddings as list of lists
-    graph_data = nx.node_link_data(reg_graph)  # Serializable dict
+    # embed node_texts and create faiss index
+    try:
+        embeddings = np.asarray(embed_model.encode(node_texts, convert_to_numpy=True))
+    except TypeError:
+        embeddings = np.asarray(embed_model.encode(node_texts))
+
+    # ensure float32 and contiguous
+    embeddings = embeddings.astype('float32')
+    faiss_dim = embeddings.shape[1]
+    faiss_index = faiss.IndexFlatIP(faiss_dim)
+    emb_to_add = np.ascontiguousarray(embeddings)
+    faiss.normalize_L2(emb_to_add)
+    faiss_index.add(emb_to_add)
+
+    # cache graph + important arrays; include node ordering so indices remain stable on reload
+    graph_data = nx.node_link_data(reg_graph)
     cache_data = {
         'graph': graph_data,
+        'node_ids': node_id_order,
         'node_texts': node_texts,
-        'embeddings': embeddings.tolist()  # List of lists for JSON
+        'embeddings': embeddings.tolist()
     }
-    with open(cache_path, 'w', encoding='utf-8') as f:
-        json.dump(cache_data, f, indent=2)
-    print(f"Built graph with {len(reg_graph.nodes)} nodes, {len(reg_graph.edges)} edges. Cached as JSON.")
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, indent=2)
+        logging.info(f"Built regulation graph (nodes={len(node_id_order)}, edges={reg_graph.number_of_edges()}) and cached.")
+    except Exception as e:
+        logging.warning(f"Failed to write graph cache: {e}")
+
 
 def graph_enhanced_retrieval(section_text: str, top_k: int = 3, traversal_depth: int = 1) -> str:
-    """Hybrid retrieval: Vector search on nodes + graph traversal for relations.
-
-    Embeds query, FAISS top-k nodes, traverses neighbors (depth-limited), linearizes subgraph.
-    Returns enriched regs text with paths (e.g., 'Reg101 [requires] RegB: texts...').
-
-    Args:
-        section_text (str): Project section for query.
-        top_k (int): Initial vector matches.
-        traversal_depth (int): Graph hops (1-2 for efficiency).
-
-    Returns:
-        str: Retrieved regs text.
     """
-    global reg_graph, faiss_index, node_texts
-    if reg_graph is None or faiss_index is None:
+    Hybrid retrieval: embed the query, search FAISS, map results to node IDs using node_id_order,
+    and return a short linearized subgraph that includes relations/evidence.
+    Returns a concise string (trimmed) suitable to pass to the LLM prompt.
+    """
+    global reg_graph, faiss_index, node_texts, node_id_order, node_id_to_text
+
+    if reg_graph is None or faiss_index is None or not node_id_order:
         build_reg_graph()
 
-    query_emb = embed_model.encode([section_text])
-    faiss.normalize_L2(query_emb)
-    scores, indices = faiss_index.search(query_emb.astype('float32'), top_k)
+    if reg_graph is None or faiss_index is None or not node_id_order:
+        return "No regulations available."
 
-    retrieved = []
-    node_ids = list(reg_graph.nodes)
-    for idx in indices[0]:
-        if idx == -1 or idx >= len(node_ids): continue
-        node_id = node_ids[idx]
-        node_text = node_texts[idx]
+    # embed query robustly
+    try:
+        q_emb = np.asarray(embed_model.encode([section_text], convert_to_numpy=True)).astype('float32')
+    except TypeError:
+        q_emb = np.asarray(embed_model.encode([section_text])).astype('float32')
 
-        # Traverse: Collect subgraph (self + neighbors up to depth)
+    q_emb = np.ascontiguousarray(q_emb)
+    faiss.normalize_L2(q_emb)
+    try:
+        scores, indices = faiss_index.search(q_emb, top_k)
+    except Exception as e:
+        logging.error(f"FAISS search failed: {e}")
+        return "Regulations retrieval failed."
+
+    retrieved_parts = []
+    for i, idx in enumerate(indices[0]):
+        if idx == -1 or idx >= len(node_id_order):
+            continue
+        node_id = node_id_order[idx]
+        node_text = node_id_to_text.get(node_id, reg_graph.nodes[node_id].get('text', ''))
+        # collect neighbors (ego graph) due to traversal_depth
         subgraph = nx.ego_graph(reg_graph, node_id, radius=traversal_depth)
-        path_text = f"Node {node_id}: {node_text}"
+        # linearize: node + immediate edges (limit lengths)
+        part = f"[{node_id}] {node_text[:300]}"
         for u, v, data in subgraph.edges(data=True):
-            path_text += f" | {u} [{data['relation']}] {v}: {data['evidence'][:100]}..."
+            rel = data.get('relation', '')
+            evidence = data.get('evidence', '')[:180]
+            part += f" -> {u} [{rel}] {v}: {evidence}..."
+        retrieved_parts.append(part[:1200])  # trim each retrieved part to avoid huge prompts
 
-        retrieved.append(path_text)
+    if not retrieved_parts:
+        return "No relevant regulations found."
 
-    return "Relevant Regulations with Relations: " + " | ".join(retrieved)
+    return "Relevant Regulations with Relations: " + " || ".join(retrieved_parts)
+
+
+def _extract_json_array_from_text(text: str) -> Optional[str]:
+    """
+    Helper: extract the first JSON array substring (a [...] block) from text (dotall).
+    Returns the substring or None if not found.
+    """
+    m = re.search(r'(\[[\s\S]*\])', text)
+    if m:
+        return m.group(1)
+    return None
 
 def split_pdf_into_sections(pdf_path):
     """Split project PDF into semantic sections using hybrid_chunking.
@@ -856,94 +1038,392 @@ def split_pdf_into_sections(pdf_path):
         sections.append({"title": title, "content": chunk['text'], "metadata": metadata})
     return sections
 
-def check_compliance_for_section(section, model_name = str(LLM_MODEL_NAME)):
-    """Checks a single section for compliance using Ollama LLM with graph-enhanced RAG.
-
-    Stateless call: Fresh prompt per section to isolate context.
-    Output: JSON flags for non-compliance.
-
-    Args:
-        section (Dict[str, Any]): From split_pdf_into_sections.
-        model_name (str): Ollama model.
-
-    Returns:
-        List[Dict[str, Any]]: Flags like [{'issue': str, 'evidence': str, 'reg_ref': str, 'severity': str, 'confidence': float}].
-                              Empty list if compliant.
+def check_compliance_for_section_with_regex(section: Dict[str, Any], rag_regs: str, model_name: str = str(LLM_MODEL_NAME)):
     """
-    section_text = section['content']
-    rag_regs = graph_enhanced_retrieval(section_text)
+    Enhanced compliance check:
+    - Extracts structured JSON facts from section and regs using regex.
+    - Passes both raw text and extracted JSON to AI.
+    - Saves JSON, query, and AI answer to a log file for transparency.
+    
+    Returns:
+        dict with 'flags' (AI output), 'facts' (structured facts used), 'answer' (LLM raw answer)
+    """
+    section_text = section.get("content", "")
+    
+    # Extract structured facts
+    guideline_facts = extract_facts_to_json(section_text, source="guideline")
+    reg_facts = extract_facts_to_json(rag_regs, source="regulation")
+    
+    structured_json = {
+        "guideline_facts": guideline_facts,
+        "regulation_facts": reg_facts
+    }
 
+    # Create prompt for AI
     prompt = f"""
-You are a regulatory compliance expert for GIS/environmental projects.
-Analyze ONLY this section: Do not reference or assume other project parts.
+You are a regulatory compliance expert.
+Here is a project section and relevant regulations.
 
-Section Title: {section['title']}
+Section Title: {section.get('title')}
 Section Content: {section_text}
 
-Relevant Regulations with Relations: {rag_regs}
+Relevant Regulations: {rag_regs}
 
-Perform line-by-line check for non-compliance, considering relationships (e.g., dependencies).
-Flag ONLY violations.
-For each flag:
-- issue: Brief description.
-- evidence: Exact quote from section.
-- reg_ref: Quote from regulations (include relation if relevant).
-- severity: 'high'/'medium'/'low'.
-- confidence: 0.0-1.0.
+Here are structured facts extracted with regex:
+{json.dumps(structured_json, indent=2)}
 
-If compliant, return empty list [].
-Output PURE JSON: [{{"issue": "...", "evidence": "...", "reg_ref": "...", "severity": "...", "confidence": 0.95}}]
+Use BOTH the raw text and structured facts to check for violations.
+Output PURE JSON list of flags with keys:
+["issue","evidence","reg_ref","severity","confidence"].
 """
 
+    # Call LLM
     try:
         response = llm.chat(model=model_name, messages=[{'role': 'user', 'content': prompt}],
-                           options={"temperature": 0.6, "top_p": 0.95, "top_k": 20, "repeat_penalty": 1.1, "enable_thinking": THINK_MODE})
+                           options={"temperature": 0.4, "top_p": 0.9})
         output = response['message']['content'].strip()
-
-        flags = json.loads(output)
-        if not isinstance(flags, list):
+        try:
+            flags = json.loads(output)
+        except Exception:
             flags = []
-    except (json.JSONDecodeError, KeyError, Exception) as e:
-        logging.error(f"Compliance check error: {e}")
+    except Exception as e:
+        logging.error(f"Regex+AI compliance check failed: {e}")
         flags = []
 
-    # Annotate with section metadata
-    for flag in flags:
-        flag['section_title'] = section['title']
-        flag['metadata'] = section['metadata']
+    # Save transparency log
+    log_entry = {
+        "section_title": section.get("title"),
+        "section_content": section_text[:400],
+        "relevant_regs": rag_regs[:400],
+        "structured_facts": structured_json,
+        "ai_answer": output if 'output' in locals() else "",
+        "flags": flags
+    }
+    with open("compliance_logs.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(log_entry) + "\n")
 
-    return flags
+    return {"flags": flags, "facts": structured_json, "answer": output}
 
-def check_file_compliance(project_desc: str, project_pdf_path):
-    """Full compliance checker: Splits project PDF, checks sections with graph RAG, aggregates flags.
 
-    Args:
-        project_desc (str): User description (for logging/context).
-        project_pdf_path (str): Path to project PDF.
 
-    Returns:
-        Dict[str, Any]: Report {'flags': [...], 'overall_summary': {...}}.
+# def check_compliance_for_section(section: Dict[str, Any], model_name: str = str(LLM_MODEL_NAME)) -> List[Dict[str, Any]]:
+#     """
+#     Call LLM to check a single section and parse JSON output robustly.
+#     Input:
+#         section: dict with 'title','content','metadata'
+#     Output:
+#         list of flags (each dict with issue/evidence/reg_ref/severity/confidence) OR []
+#     """
+#     section_text = section.get('content', '')
+#     rag_regs = graph_enhanced_retrieval(section_text)
+
+#     # limit rag_regs length so prompt fits (trim safely)
+#     MAX_RAG_CHARS = 4000
+#     if len(rag_regs) > MAX_RAG_CHARS:
+#         rag_regs = rag_regs[:MAX_RAG_CHARS] + "\n\n[TRUNCATED]"
+
+#     prompt = f"""
+# You are a regulatory compliance expert for GIS/environmental projects.
+# Analyze ONLY this section: Do not reference or assume other project parts.
+
+# Section Title: {section.get('title')}
+# Section Content: {section_text}
+
+# Relevant Regulations with Relations: {rag_regs}
+
+# Perform a line-by-line check for non-compliance, considering relationships (e.g., dependencies).
+# Flag ONLY violations.
+# For each flag, return an object with:
+# - issue: Brief description.
+# - evidence: Exact quote from section.
+# - reg_ref: Quote from regulations (include relation if relevant).
+# - severity: 'high'/'medium'/'low'.
+# - confidence: number between 0.0 and 1.0.
+
+# If compliant, return empty list [].
+
+# Output PURE JSON (a single JSON array). Example:
+# [{{"issue":"...", "evidence":"...", "reg_ref":"...", "severity":"high", "confidence":0.95}}]
+# """
+
+#     try:
+#         # call LLM (keep same options you used)
+#         response = llm.chat(
+#             model=model_name,
+#             messages=[{'role': 'user', 'content': prompt}],
+#             options={"temperature": 0.6, "top_p": 0.95, "top_k": 20, "repeat_penalty": 1.1, "enable_thinking": THINK_MODE}
+#         )
+
+#         # flexible unpack of different response shapes
+#         if isinstance(response, dict):
+#             # typical shape: {'message': {'content': '...'}}
+#             output_text = ""
+#             if 'message' in response and isinstance(response['message'], dict):
+#                 output_text = response['message'].get('content', '')
+#             else:
+#                 # fallback
+#                 output_text = str(response)
+#         elif hasattr(response, 'message') and hasattr(response.message, 'content'):
+#             output_text = response.message.content
+#         else:
+#             output_text = str(response)
+
+#         output_text = output_text.strip()
+
+#         # Try to parse JSON directly; if it fails, extract JSON substring
+#         try:
+#             flags = json.loads(output_text)
+#             if not isinstance(flags, list):
+#                 raise ValueError("Parsed JSON is not a list")
+#         except Exception:
+#             json_sub = _extract_json_array_from_text(output_text)
+#             if json_sub:
+#                 try:
+#                     flags = json.loads(json_sub)
+#                     if not isinstance(flags, list):
+#                         flags = []
+#                 except Exception as e:
+#                     logging.error(f"Failed to parse extracted JSON substring: {e}. Full output: {output_text[:1000]}")
+#                     flags = []
+#             else:
+#                 logging.error(f"LLM output did not contain JSON array. Output head: {output_text[:500]}")
+#                 flags = []
+
+#     except Exception as e:
+#         logging.error(f"LLM call or parsing failed: {e}")
+#         flags = []
+
+#     # annotate with metadata safely
+#     safe_flags = []
+#     for f in flags:
+#         if not isinstance(f, dict):
+#             continue
+#         f.setdefault('section_title', section.get('title'))
+#         f.setdefault('metadata', section.get('metadata', {}))
+#         # ensure keys exist and cast confidence to float between 0 and 1
+#         f.setdefault('issue', '')
+#         f.setdefault('evidence', '')
+#         f.setdefault('reg_ref', '')
+#         f.setdefault('severity', 'medium')
+#         try:
+#             f['confidence'] = float(f.get('confidence', 0.5))
+#             if f['confidence'] < 0: f['confidence'] = 0.0
+#             if f['confidence'] > 1: f['confidence'] = 1.0
+#         except Exception:
+#             f['confidence'] = 0.5
+#         safe_flags.append(f)
+
+#     return safe_flags
+
+
+
+def check_file_compliance(project_desc: str, project_pdf_path: str):
     """
+    Compliance checker: Splits project PDF, checks sections aginst regulations graph RAG, aggregates flags.
+
+    Returns a report dict that preserves the original keys and includes:
+      - section_reports: List[ { index, title, flags, error (or None), duration_s, skipped } ]
+      - processing_time_s: total time spent for this file
+    """
+    start_total = time.time()
+    project_pdf_path = os.path.abspath(project_pdf_path)
+
     if not os.path.exists(project_pdf_path):
         raise ValueError(f"Project PDF not found: {project_pdf_path}")
 
-    sections = split_pdf_into_sections(project_pdf_path)
-    all_flags = []
-    for section in sections:
-        flags = check_compliance_for_section(section)
-        all_flags.extend(flags)
+    # Attempt to split into sections; propagate error (caller typically handles it)
+    try:
+        sections = split_pdf_into_sections(project_pdf_path)
+    except Exception as e:
+        logging.exception(f"Failed to split PDF into sections: {project_pdf_path}")
+        # Keep the raising behavior for a missing/invalid PDF as before.
+        raise
+
+    all_flags: List[Dict[str, Any]] = []
+    section_reports: List[Dict[str, Any]] = []
+
+    if not sections:
+        # No content extracted — return an explicit report (keeps original keys)
+        report = {
+            "project_desc": project_desc,
+            "project_pdf": project_pdf_path,
+            "sections_checked": 0,
+            "section_reports": [],
+            "flags": [],
+            "overall_summary": {
+                "total_flags": 0,
+                "compliance_status": "No content extracted"
+            },
+            "processing_time_s": time.time() - start_total
+        }
+        return report
+
+    # Process each section independently; capture exceptions per-section
+    for idx, section in enumerate(sections):
+        t0 = time.time()
+        sec_report: Dict[str, Any] = {
+            "index": idx,
+            "title": section.get("title"),
+            "metadata": section.get("metadata", {}),
+            "flags": [],
+            "error": None,
+            "duration_s": None,
+            "skipped": False
+        }
+
+        # Lightweight skip: skip sections with essentially no content
+        content = (section.get("content") or "").strip()
+        if len(content) < 20:
+            sec_report["skipped"] = True
+            sec_report["duration_s"] = 0.0
+            section_reports.append(sec_report)
+            continue
+
+        try:
+            # Main call (this may call LLM)
+            flags = check_compliance_for_section_with_regex(section)
+            if not isinstance(flags, list):
+                logging.warning(f"check_compliance_for_section_with_regex returned non-list for section {idx} of {project_pdf_path}")
+                flags = []
+            # annotate each flag with section index/title if not already present
+            for f in flags:
+                if isinstance(f, dict):
+                    f.setdefault("section_index", idx)
+                    f.setdefault("section_title", section.get("title"))
+            sec_report["flags"] = flags
+            all_flags.extend(flags)
+        except Exception as e:
+            logging.exception(f"Error checking compliance for section {idx} in {project_pdf_path}: {e}")
+            sec_report["error"] = str(e)
+            # Continue processing other sections (do not re-raise)
+        finally:
+            sec_report["duration_s"] = time.time() - t0
+            section_reports.append(sec_report)
+
+        # Optional: memory check after each section (uncomment if desired)
+        # if not check_memory_usage():
+        #     memory_cleanup()
+
+    total_flags = len(all_flags)
+    processing_time = time.time() - start_total
 
     report = {
         "project_desc": project_desc,
         "project_pdf": project_pdf_path,
         "sections_checked": len(sections),
+        "section_reports": section_reports,
         "flags": all_flags,
         "overall_summary": {
-            "total_flags": len(all_flags),
-            "compliance_status": "Compliant" if len(all_flags) == 0 else "Non-Compliant (Review Required)"
-        }
+            "total_flags": total_flags,
+            "compliance_status": "Compliant" if total_flags == 0 else "Non-Compliant (Review Required)"
+        },
+        "processing_time_s": processing_time
     }
     return report
+
+
+def check_project_compliance(compliance_folder = project_guidelines_folder, project_desc: str = None):
+    """
+    Batch compliance checker: Processes all PDFs in the project guidelines folder folder, then generates individual compliance reports .
+    """
+    start_batch = time.time()
+    if not os.path.exists(compliance_folder):
+        logging.error(f"Compliance folder not found: {compliance_folder}")
+        return {"error": f"Folder not found: {compliance_folder}"}
+
+    # deterministic order and case-insensitive pdf detection
+    pdf_files = sorted([f for f in os.listdir(compliance_folder) if f.lower().endswith(".pdf")])
+
+    if not pdf_files:
+        logging.warning(f"No PDF files found in {compliance_folder}")
+        return {"error": "No PDF files found in folder"}
+
+    logging.info(f"Processing {len(pdf_files)} PDFs for compliance checking...")
+    print(f"\nProcessing {len(pdf_files)} project PDFs for compliance...\n")
+
+    all_reports: List[Dict[str, Any]] = []
+    total_flags = 0
+    files_checked = 0
+    files_failed = 0
+
+    for pdf_file in pdf_files:
+        pdf_path = os.path.join(compliance_folder, pdf_file)
+        desc = project_desc or f"Compliance check for {pdf_file}" ##IMPROVE##
+
+        print(f"Checking: {pdf_file}...")
+        file_start = time.time()
+        try:
+            report = check_file_compliance(desc, pdf_path)
+            # Ensure a dict
+            if not isinstance(report, dict):
+                raise RuntimeError("Child report is not a dict")
+
+            # attach filename and timing
+            report["filename"] = pdf_file
+            report["processing_time_s"] = report.get("processing_time_s", time.time() - file_start)
+
+            all_reports.append(report)
+            # safe read of flags from child report
+            file_flags = report.get("overall_summary", {}).get("total_flags", 0)
+            try:
+                file_flags = int(file_flags)
+            except Exception:
+                file_flags = 0
+            total_flags += file_flags
+            files_checked += 1
+
+            status = "✓ Compliant" if file_flags == 0 else f"✗ {file_flags} violations"
+            print(f"  {status}\n")
+
+        except Exception as e:
+            logging.exception(f"Failed to process {pdf_file}: {e}")
+            files_failed += 1
+            print(f"  ✗ Error processing file: {e}\n")
+
+    batch_time = time.time() - start_batch
+    aggregated_report = {
+        "batch_description": project_desc or "Batch compliance check",
+        "compliance_folder": compliance_folder,
+        "files_checked": files_checked,
+        "files_failed": files_failed,
+        "total_pdfs": len(pdf_files),
+        "total_violations": total_flags,
+        "individual_reports": all_reports,
+        "overall_summary": {
+            "compliant_files": sum(1 for r in all_reports if r.get("overall_summary", {}).get("total_flags", 0) == 0),
+            "non_compliant_files": sum(1 for r in all_reports if r.get("overall_summary", {}).get("total_flags", 0) > 0),
+            "total_flags_across_all_files": total_flags,
+            "batch_status": "All Compliant" if total_flags == 0 else f"{total_flags} Total Violations Across {files_checked} Files"
+        },
+        "processing_time_s": batch_time
+    }
+    return aggregated_report
+
+# End of @Compliance Functions
+
+def visualize_reg_graph(output_path: str = "reg_graph.png"):
+    """
+    Visualize the regulations graph for the user for transparency.
+    
+    Args:
+        output_path (str): File path to save the visualization.
+    """
+    global reg_graph
+    if reg_graph is None or reg_graph.number_of_nodes() == 0:
+        print("No regulation graph available to visualize.")
+        return
+
+    plt.figure(figsize=(12, 8))
+    pos = nx.spring_layout(reg_graph, k=0.5, iterations=50)
+    nx.draw(reg_graph, pos, with_labels=True, node_size=1500, node_color="lightblue", font_size=8, font_weight="bold", arrowsize=15)
+    edge_labels = nx.get_edge_attributes(reg_graph, 'relation')
+    nx.draw_networkx_edge_labels(reg_graph, pos, edge_labels=edge_labels, font_size=7)
+
+    plt.title("Regulation Graph")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+    print(f"Graph visualization saved at {output_path}")
 
 def ingest_documents():
     """Ingest documents into SQLite + FAISS"""
@@ -1122,7 +1602,8 @@ def main():
         print(f"Found {db.get_document_count()} documents in database.")
     
     # Main REPL with streaming
-    print("\nWelcome to GreenPolicyAI (Advanced Edition)")
+    print("\nWelcome to GreenPolicyAI.")
+    print("To perform a compliance check, please type '!COMPLIANCE!'")
     print("Type 'exit' or 'quit' to end the program.")
     print("-" * 50)
     
@@ -1132,7 +1613,6 @@ def main():
             
             if not user_input:
                 continue
-            
 
             if user_input.lower() in ["exit", "quit"]:
                 print("Goodbye!")
@@ -1142,11 +1622,19 @@ def main():
             if not check_memory_usage():
                 print("Warning: High memory usage detected. Consider restarting.")
                 memory_cleanup()
-            
-            # Process query with streaming
-            start_time = time.time()
-            response, sources = ask_rag_streaming(user_input)
-            end_time = time.time()
+
+            # Use compliance checker if requested 
+            if user_input in ["!COMPLIANCE!"]:
+                start_time = time.time()
+                print("Beginning Compliance Check...")
+                check_project_compliance()
+                end_time = time.time()
+
+            # Else process query as usual
+            else:
+                start_time = time.time()
+                response, sources = ask_rag_streaming(user_input)
+                end_time = time.time()
             
             # Show sources
             if sources:
@@ -1163,6 +1651,7 @@ def main():
             logging.error("System memory error")
             print("System out of memory. Restarting recommended.")
             memory_cleanup()
+
         except Exception as e:
             logging.error(f"Main loop error: {e}")
             print(f"An error occurred: {e}")
