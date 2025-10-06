@@ -1,22 +1,17 @@
-## BETA VERSION 5
+## BETA VERSION 5.0.1
 # Changes:
 '''
--  Fully implemented project compliance checker against regulations. 
-- Integrated Graph Knowledge Base for improved regulations traversing (better literal and overall context)
-using NetworkX (in-memory) and FAISS (hybrid vector-graph retrieval) instead of only regular RAG. 
-- Implemented Rule-based extraction with spaCy + regex for entities/relations (no extra LLM calls for efficiency).
-- Adapted build_reg_graph to use "Regulations Folder" and parse PDFs for extraction
-- Implemented split_pdf_into_sections using hybrid_chunking for project PDFs.
-- Fully implemented compliance cheking system with graph-enhanced dual retrieval for regulations.
-- Updated check_compliance to handle project PDF path (prompt user in REPL for compliance mode).
-- Integrated into REPL: For "compliance:", prompt for project PDF path, then process.
-- Switched to Redis for cross-session caching for embeddings, query results, and LLM responses. 
-- Added dynamic constants and memory checking for smoother compute usage.
-- Enabled streaming responses for better user experience. Added more system messages.
-- Improved logging across project along with use of classes for containment and better error handling.
+Addressed critical issues, efficency, quick fixes, and overall robustenss (Includes but not limited to adding atomic cache saving). 
 '''
 
-
+## DIRECTORY AND PATH TEST______________________
+import os
+print("CWD:", os.getcwd())
+print("Script dir:", os.path.dirname(__file__))
+print("Looks like these folders exist?:")
+for name in ["Project Guidelines Folder", "Regulations Folder", "Knowledge Base Folder"]:
+    print(name, "->", os.path.exists(name))
+##______________________________________________
 
 import os
 import json
@@ -58,7 +53,7 @@ logging.basicConfig(
     ]
 )
 
-# Load Required DEPENDENCIES. 
+# Required @DEPENDENCIES. 
 try:
     import faiss ## FAISS
     FAISS_AVAILABLE = True
@@ -144,19 +139,26 @@ CONTEXT_WINDOW_LENGTH = constants['CONTEXT_LEN']
 TOP_K_DEFAULT = constants['TOP_K']
 THINK_MODE = False
 
-# @ Paths and Cache
-knowledge_base_folder = "Knowledge Base Folder"
-project_guidelines_folder = "Project Guidlines Folder"
-compliance_regulations_folder = "Regulations Folder"
+# User Folders
+BASE_DIR = Path(__file__).parent.resolve()
+project_guidelines_folder = str(BASE_DIR / "Project Guidelines Folder")
+compliance_regulations_folder = str(BASE_DIR / "Regulations Folder")
+knowledge_base_folder = str(BASE_DIR / "Knowledge Base Folder")
+# Debug print/log to confirm paths exist
+logging.info(f"project_guidelines_folder = {project_guidelines_folder} (exists={os.path.exists(project_guidelines_folder)})")
+logging.info(f"compliance_regulations_folder = {compliance_regulations_folder} (exists={os.path.exists(compliance_regulations_folder)})")
+logging.info(f"knowledge_base_folder = {knowledge_base_folder} (exists={os.path.exists(knowledge_base_folder)})")
 
+# @ Paths and Cache
 cache_file = "embedding_cache.json"
 DB_PATH = "greenpolicy.db"
 FAISS_INDEX_PATH = "faiss_index.bin"
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 REDIS_DB = 0
-GRAPH_CACHE = "reg_graph.pkl"  # Graph persistence
-
+#GRAPH_CACHE = "reg_graph.pkl"  # Graph persistence
+GRAPH_CACHE_JSON = "reg_graph.json"
+GRAPH_EMB_CACHE = "reg_graph_embeddings.npy"
 
 # Check for exisitng embeddings cache file
 if os.path.exists(cache_file):
@@ -166,11 +168,17 @@ else:
     embedding_cache = {}
 
 # Load spaCy for rule-based extraction (en_core_web_sm for NER)
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    print("Run: python -m spacy download en_core_web_sm")
-    raise
+nlp = None
+if SPACY_AVAILABLE and spacy is not None:
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        logging.warning("spaCy model 'en_core_web_sm' not found. Run: python -m spacy download en_core_web_sm. Falling back to blank English pipeline.")
+        nlp = spacy.blank("en")  # No NER, but keeps sentence segmentation if we add sentencizer
+        if "sentencizer" not in nlp.pipe_names:
+            nlp.add_pipe("sentencizer")
+else:
+    logging.warning("spaCy not available; NLP features will use simple regex fallback.")
 
 # Globals for graph (loaded once)
 reg_graph = None
@@ -340,7 +348,7 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Failed to add document {doc_id}: {e}")
     
-    def search_similar(self, query_embedding, top_k: int = 5):
+    def search_similar(self, query_embedding, top_k = TOP_K_DEFAULT):
         """Search for similar documents using FAISS"""
         if not self.faiss_index or not query_embedding:
             return []
@@ -642,12 +650,23 @@ def extract_pdf_text(file_path: str, password: str = None) -> str:
     try:
         logging.info(f"Processing PDF: {file_path}")
         doc = fitz.open(file_path)
-        if doc.needs_pass:
-            if password:
-                doc.authenticate(password)
-            else:
-                logging.warning(f"Skipping password-protected PDF: {file_path}")
+
+        #Handle Locked PDFs
+        if getattr(doc, "is_encrypted", False) or getattr(doc, "needs_pass", False):
+            try:
+                auth_ok = False
+                try:
+                    auth_ok = doc.authenticate("")  # may not exist on all versions
+                except Exception:
+                    auth_ok = False
+                if not auth_ok:
+                    logging.warning(f"Skipping encrypted or password-protected PDF: {file_path}")
                 return ""
+            except Exception as e:
+                logging.error(f"Error handling encrypted PDF {file_path}: {e}")
+                return ""
+            
+        # Process PDF    
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
             page_text = page.get_text("text").strip()
@@ -674,8 +693,9 @@ def extract_pdf_text(file_path: str, password: str = None) -> str:
 
 def extract_facts_to_json(text: str, source: str = "guideline") -> List[Dict[str, Any]]:
     """
-    Extracts structured facts (quantities, obligations, limits) from free text using regex.
-    
+    Robust regex-based fact extraction. Extracts structured facts (quantities, obligations, limits) from free text using regex.
+    Prioritizes longer obligation phrases (e.g., 'must not') before shorter ones (e.g., 'must') to avoid conflicting matches.
+
     Args:
         text (str): Raw guideline/regulation chunk.
         source (str): 'guideline' or 'regulation' (used for tagging).
@@ -689,32 +709,42 @@ def extract_facts_to_json(text: str, source: str = "guideline") -> List[Dict[str
         return facts
 
     # Pattern for numeric constraints like "85 tomatoes", "200 liters", "5 km"
-    num_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*([a-zA-Z]+(?:s)?)')
+    num_pattern = re.compile(r'\b(\d+(?:\.\d+)?)\s*([A-Za-z%°μµ/.\-]+)\b')
 
-    # Obligation words
-    obligations = {
+    # Obligation words (Order Layer Matters) @IMPROVE - Add more obligations
+    obligations = { 
+        "must not": "prohibited",
+        "shall not": "prohibited",
+        "may not": "prohibited",
         "must": "mandatory",
         "shall": "mandatory",
         "should": "recommended",
-        "may": "permitted",
-        "must not": "prohibited",
-        "shall not": "prohibited",
-        "may not": "prohibited"
+        "may": "permitted"
     }
+
+    # avoid false positives for page/figure markers
+    false_units = {"page", "pages", "fig", "figure", "table", "pp"}
 
     # Scan for numeric constraints
     for match in num_pattern.finditer(text):
         quantity, unit = match.groups()
+        unit_norm = unit.lower().strip()
+        if unit_norm in false_units:
+            continue
+        try:
+            qty = float(quantity)
+        except Exception:
+            continue
         facts.append({
             "type": "constraint",
             "source": source,
-            "quantity": float(quantity),
-            "unit": unit.lower(),
+            "quantity": qty,
+            "unit": unit_norm,
             "context": text[max(0, match.start()-40):match.end()+40].strip()
         })
 
-    # Scan for obligations
-    for word, label in obligations.items():
+    # Scan for obligations:iterate in order of decreasing phrase length to catch negatives first
+    for word, label in sorted(obligations.items(), key=lambda kv: -len(kv[0])):
         if re.search(rf"\b{re.escape(word)}\b", text, re.IGNORECASE):
             facts.append({
                 "type": "obligation",
@@ -724,7 +754,15 @@ def extract_facts_to_json(text: str, source: str = "guideline") -> List[Dict[str
                 "context": text[:200]  # snippet
             })
 
-    return facts
+    # dedupe simple (headless) facts by JSON string
+    seen = set()
+    deduped = []
+    for f in facts:
+        key = json.dumps(f, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+    return deduped
 
 # @COMPLIANCE FUNCTIONS
 
@@ -857,7 +895,8 @@ def build_reg_graph(regs_folder: str = compliance_regulations_folder, rebuild: b
     """
     global reg_graph, faiss_index, node_texts, node_id_order, node_id_to_text
 
-    cache_path = Path(GRAPH_CACHE)
+    cache_path = Path(GRAPH_CACHE_JSON)
+    emb_path = Path(GRAPH_EMB_CACHE)
     # Try load cache (must include explicit node_id ordering)
     if cache_path.exists() and not rebuild:
         try:
@@ -867,100 +906,137 @@ def build_reg_graph(regs_folder: str = compliance_regulations_folder, rebuild: b
             node_id_order = data.get('node_ids', list(reg_graph.nodes()))
             # node_texts array should correspond to node_id_order
             node_texts = data.get('node_texts', [reg_graph.nodes[n].get('text', '') for n in node_id_order])
-            embeddings = np.array(data['embeddings']).astype('float32')
+           # Load embeddings (prefer .npy, fallback to JSON-embedded list)
+            embeddings = None
+            if emb_path.exists():
+                try:
+                    embeddings = np.load(emb_path).astype("float32")
+                except Exception as e:
+                    logging.warning(f"Failed to load .npy embeddings: {e}")
+            else:
+                json_emb = data.get("embeddings")
+                if json_emb:
+                    embeddings = np.asarray(json_emb, dtype="float32")
+                    logging.info("Loaded embeddings from JSON fallback.")
 
-            # Build FAISS index
-            dim = embeddings.shape[1]
-            faiss_index = faiss.IndexFlatIP(dim)
-            emb_to_add = np.ascontiguousarray(embeddings)
-            faiss.normalize_L2(emb_to_add)
-            faiss_index.add(emb_to_add)
+            # Verify embedding integrity
+            if embeddings is not None:
+                embeddings = np.atleast_2d(np.ascontiguousarray(embeddings)).astype("float32")
 
-            # build mapping dict
-            node_id_to_text = {nid: node_texts[i] if i < len(node_texts) else reg_graph.nodes[nid].get('text', '') for i, nid in enumerate(node_id_order)}
-            logging.info("Loaded regulation graph and FAISS index from cache.")
-            return
+                if len(node_id_order) != embeddings.shape[0]:
+                    logging.warning(
+                        f"Node/embedding count mismatch: {len(node_id_order)} nodes vs {embeddings.shape[0]} embeddings. Rebuilding recommended."
+                    )
+
+                # Build FAISS index if available
+                if "faiss" in globals() and faiss is not None:
+                    dim = embeddings.shape[1]
+                    faiss_index = faiss.IndexFlatIP(dim)
+                    faiss.normalize_L2(embeddings)
+                    faiss_index.add(embeddings)
+                    logging.info(f"FAISS index loaded (dim={dim}, nodes={len(node_id_order)}).")
+                else:
+                    faiss_index = None
+                    logging.warning("FAISS not available; skipping index creation.")
+
+                node_id_to_text = {
+                    nid: node_texts[i] if i < len(node_texts)
+                    else reg_graph.nodes[nid].get("text", "")
+                    for i, nid in enumerate(node_id_order)
+                }
+
+                logging.info("Loaded regulation graph and embeddings from cache.")
+                return
+            else:
+                logging.warning("Embeddings missing in cache, rebuilding...")
         except Exception as e:
-            logging.warning(f"Failed loading graph cache ({e}), rebuilding...")
+            logging.warning(f"Failed to load graph cache ({e}), rebuilding...")
 
-    # Build from scratch
+    # Rebuild graph from scratch
     if not os.path.exists(regs_folder):
         logging.error(f"Regulations folder not found: {regs_folder}")
         reg_graph = nx.DiGraph()
+        faiss_index = None
+        node_texts, node_id_order, node_id_to_text = [], [], {}
         return
 
     pdf_files = [f for f in os.listdir(regs_folder) if f.lower().endswith(".pdf")]
     all_triples = []
-    # parse each PDF once, extract triples
+
     for file_name in pdf_files:
         pdf_path = os.path.join(regs_folder, file_name)
         try:
             md = extract_pdf_text(pdf_path)
             triples = extract_entities_relations(md)
-            # optional: attach source info to each triple
             for t in triples:
-                t.setdefault('source', file_name)
+                t.setdefault("source", file_name)
             all_triples.extend(triples)
         except Exception as e:
-            logging.warning(f"Failed parse {file_name}: {e}")
+            logging.warning(f"Failed to parse {file_name}: {e}")
 
-    # Build graph edges/nodes
     reg_graph = nx.DiGraph()
     for t in all_triples:
-        h = t['head']
-        ta = t['tail']
-        # add nodes (if not exist) and store a small text snippet
-        if 'text' not in reg_graph.nodes.get(h, {}):
+        h, ta = t["head"], t["tail"]
+        if "text" not in reg_graph.nodes.get(h, {}):
             reg_graph.add_node(h, text=f"{h}: {t.get('evidence','')[:300]}")
-        if 'text' not in reg_graph.nodes.get(ta, {}):
+        if "text" not in reg_graph.nodes.get(ta, {}):
             reg_graph.add_node(ta, text=f"{ta}: {t.get('evidence','')[:300]}")
-        # add edge
-        reg_graph.add_edge(h, ta, relation=t.get('relation', 'applies_to'), evidence=t.get('evidence', ''), source=t.get('source'))
+        reg_graph.add_edge(
+            h, ta,
+            relation=t.get("relation", "applies_to"),
+            evidence=t.get("evidence", ""),
+            source=t.get("source")
+        )
 
     if reg_graph.number_of_nodes() == 0:
-        logging.warning("No nodes found in reg_graph after parsing.")
-        node_texts = []
-        node_id_order = []
-        node_id_to_text = {}
+        logging.warning("No nodes found after parsing regulations.")
+        reg_graph = nx.DiGraph()
         faiss_index = None
+        node_texts, node_id_order, node_id_to_text = [], [], {}
         return
 
-    # Define insertion order and node_texts in that order (stable mapping)
-    node_id_order = list(reg_graph.nodes())  # insertion order is preserved by networkx (>=2.0)
-    node_texts = [reg_graph.nodes[n].get('text', '') for n in node_id_order]
+    node_id_order = list(reg_graph.nodes())
+    node_texts = [reg_graph.nodes[n].get("text", "") for n in node_id_order]
     node_id_to_text = {nid: node_texts[i] for i, nid in enumerate(node_id_order)}
 
-    # embed node_texts and create faiss index
     try:
-        embeddings = np.asarray(embed_model.encode(node_texts, convert_to_numpy=True))
+        embeddings = np.asarray(embed_model.encode(node_texts, convert_to_numpy=True)).astype("float32")
     except TypeError:
-        embeddings = np.asarray(embed_model.encode(node_texts))
+        embeddings = np.asarray(embed_model.encode(node_texts)).astype("float32")
 
-    # ensure float32 and contiguous
-    embeddings = embeddings.astype('float32')
-    faiss_dim = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatIP(faiss_dim)
-    emb_to_add = np.ascontiguousarray(embeddings)
-    faiss.normalize_L2(emb_to_add)
-    faiss_index.add(emb_to_add)
+    embeddings = np.atleast_2d(np.ascontiguousarray(embeddings))
+    faiss_index = None
+    if "faiss" in globals() and faiss is not None:
+        dim = embeddings.shape[1]
+        faiss_index = faiss.IndexFlatIP(dim)
+        faiss.normalize_L2(embeddings)
+        faiss_index.add(embeddings)
+        logging.info(f"FAISS index built (dim={dim}, nodes={len(node_id_order)}).")
+    else:
+        logging.warning("FAISS not available; skipping index creation.")
 
-    # cache graph + important arrays; include node ordering so indices remain stable on reload
+    # Atomic cache saving in case of crashes
     graph_data = nx.node_link_data(reg_graph)
     cache_data = {
-        'graph': graph_data,
-        'node_ids': node_id_order,
-        'node_texts': node_texts,
-        'embeddings': embeddings.tolist()
+        "graph": graph_data,
+        "node_ids": node_id_order,
+        "node_texts": node_texts
     }
+
+    tmp_emb = str(emb_path) + ".tmp"
+    tmp_json = str(cache_path) + ".tmp"
+
     try:
-        with open(cache_path, 'w', encoding='utf-8') as f:
+        np.save(tmp_emb, embeddings)
+        os.replace(tmp_emb, emb_path)
+        with open(tmp_json, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, indent=2)
-        logging.info(f"Built regulation graph (nodes={len(node_id_order)}, edges={reg_graph.number_of_edges()}) and cached.")
+        os.replace(tmp_json, cache_path)
+        logging.info(f"Built and cached regulation graph ({len(node_id_order)} nodes, {reg_graph.number_of_edges()} edges).")
     except Exception as e:
-        logging.warning(f"Failed to write graph cache: {e}")
+        logging.warning(f"Failed to write cache files: {e}")
 
-
-def graph_enhanced_retrieval(section_text: str, top_k: int = 3, traversal_depth: int = 1) -> str:
+def graph_enhanced_retrieval(section_text: str, top_k = TOP_K_DEFAULT, traversal_depth: int = 1) -> str:
     """
     Hybrid retrieval: embed the query, search FAISS, map results to node IDs using node_id_order,
     and return a short linearized subgraph that includes relations/evidence.
@@ -1044,22 +1120,26 @@ def check_compliance_for_section_with_regex(section: Dict[str, Any], rag_regs: s
     - Extracts structured JSON facts from section and regs using regex.
     - Passes both raw text and extracted JSON to AI.
     - Saves JSON, query, and AI answer to a log file for transparency.
-    
+    - Extracts structured JSON facts from section and regs using regex.
+    - If rag_regs is not provided, compute it via graph_enhanced_retrieval.
+    - Calls the LLM and attempts robust JSON extraction.
+
     Returns:
         dict with 'flags' (AI output), 'facts' (structured facts used), 'answer' (LLM raw answer)
     """
-    section_text = section.get("content", "")
-    
+    section_text = section.get("content", "") or ""
+    if rag_regs is None:
+        try:
+            rag_regs = graph_enhanced_retrieval(section_text)
+        except Exception as e:
+            rag_regs = ""
+
     # Extract structured facts
     guideline_facts = extract_facts_to_json(section_text, source="guideline")
-    reg_facts = extract_facts_to_json(rag_regs, source="regulation")
-    
-    structured_json = {
-        "guideline_facts": guideline_facts,
-        "regulation_facts": reg_facts
-    }
+    reg_facts = extract_facts_to_json(rag_regs or "", source="regulation")
+    structured_json = {"guideline_facts": guideline_facts, "regulation_facts": reg_facts}
 
-    # Create prompt for AI
+    # Compliance prompt for AI
     prompt = f"""
 You are a regulatory compliance expert.
 Here is a project section and relevant regulations.
@@ -1077,18 +1157,59 @@ Output PURE JSON list of flags with keys:
 ["issue","evidence","reg_ref","severity","confidence"].
 """
 
+    output = ""   # always defined
+    flags: List[Dict[str, Any]] = []
+
     # Call LLM
     try:
         response = llm.chat(model=model_name, messages=[{'role': 'user', 'content': prompt}],
                            options={"temperature": 0.4, "top_p": 0.9})
-        output = response['message']['content'].strip()
+        # extract text robustly
+        if isinstance(response, dict) and 'message' in response and isinstance(response['message'], dict):
+            output = response['message'].get('content', '')
+        elif hasattr(response, 'message') and hasattr(response.message, 'content'):
+            output = response.message.content
+        else:
+            output = str(response)
+        output = output.strip()
+
+        # Try direct parse, then fallback to JSON substring extraction
         try:
-            flags = json.loads(output)
+            parsed = json.loads(output)
+            if isinstance(parsed, list):
+                flags = parsed
         except Exception:
-            flags = []
+            json_sub = _extract_json_array_from_text(output)
+            if json_sub:
+                try:
+                    parsed = json.loads(json_sub)
+                    if isinstance(parsed, list):
+                        flags = parsed
+                except Exception:
+                    flags = []
+            else:
+                flags = []
     except Exception as e:
         logging.error(f"Regex+AI compliance check failed: {e}")
         flags = []
+
+    # normalize flags: ensure list of dicts, normalize confidence values
+    safe_flags = []
+    for f in flags:
+        if not isinstance(f, dict):
+            continue
+        f.setdefault('issue', '')
+        f.setdefault('evidence', '')
+        f.setdefault('reg_ref', '')
+        f.setdefault('severity', 'medium')
+        # normalize confidence
+        try:
+            conf = float(f.get('confidence', 0.5))
+            conf = max(0.0, min(1.0, conf))
+        except Exception:
+            conf = 0.5
+        f['confidence'] = conf
+        safe_flags.append(f)
 
     # Save transparency log
     log_entry = {
@@ -1096,126 +1217,16 @@ Output PURE JSON list of flags with keys:
         "section_content": section_text[:400],
         "relevant_regs": rag_regs[:400],
         "structured_facts": structured_json,
-        "ai_answer": output if 'output' in locals() else "",
+        "ai_answer": output,
         "flags": flags
     }
-    with open("compliance_logs.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(log_entry) + "\n")
+    try:
+        with open("compliance_logs.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except Exception as e:
+        logging.warning(f"Failed to write compliance log: {e}")
 
     return {"flags": flags, "facts": structured_json, "answer": output}
-
-
-
-# def check_compliance_for_section(section: Dict[str, Any], model_name: str = str(LLM_MODEL_NAME)) -> List[Dict[str, Any]]:
-#     """
-#     Call LLM to check a single section and parse JSON output robustly.
-#     Input:
-#         section: dict with 'title','content','metadata'
-#     Output:
-#         list of flags (each dict with issue/evidence/reg_ref/severity/confidence) OR []
-#     """
-#     section_text = section.get('content', '')
-#     rag_regs = graph_enhanced_retrieval(section_text)
-
-#     # limit rag_regs length so prompt fits (trim safely)
-#     MAX_RAG_CHARS = 4000
-#     if len(rag_regs) > MAX_RAG_CHARS:
-#         rag_regs = rag_regs[:MAX_RAG_CHARS] + "\n\n[TRUNCATED]"
-
-#     prompt = f"""
-# You are a regulatory compliance expert for GIS/environmental projects.
-# Analyze ONLY this section: Do not reference or assume other project parts.
-
-# Section Title: {section.get('title')}
-# Section Content: {section_text}
-
-# Relevant Regulations with Relations: {rag_regs}
-
-# Perform a line-by-line check for non-compliance, considering relationships (e.g., dependencies).
-# Flag ONLY violations.
-# For each flag, return an object with:
-# - issue: Brief description.
-# - evidence: Exact quote from section.
-# - reg_ref: Quote from regulations (include relation if relevant).
-# - severity: 'high'/'medium'/'low'.
-# - confidence: number between 0.0 and 1.0.
-
-# If compliant, return empty list [].
-
-# Output PURE JSON (a single JSON array). Example:
-# [{{"issue":"...", "evidence":"...", "reg_ref":"...", "severity":"high", "confidence":0.95}}]
-# """
-
-#     try:
-#         # call LLM (keep same options you used)
-#         response = llm.chat(
-#             model=model_name,
-#             messages=[{'role': 'user', 'content': prompt}],
-#             options={"temperature": 0.6, "top_p": 0.95, "top_k": 20, "repeat_penalty": 1.1, "enable_thinking": THINK_MODE}
-#         )
-
-#         # flexible unpack of different response shapes
-#         if isinstance(response, dict):
-#             # typical shape: {'message': {'content': '...'}}
-#             output_text = ""
-#             if 'message' in response and isinstance(response['message'], dict):
-#                 output_text = response['message'].get('content', '')
-#             else:
-#                 # fallback
-#                 output_text = str(response)
-#         elif hasattr(response, 'message') and hasattr(response.message, 'content'):
-#             output_text = response.message.content
-#         else:
-#             output_text = str(response)
-
-#         output_text = output_text.strip()
-
-#         # Try to parse JSON directly; if it fails, extract JSON substring
-#         try:
-#             flags = json.loads(output_text)
-#             if not isinstance(flags, list):
-#                 raise ValueError("Parsed JSON is not a list")
-#         except Exception:
-#             json_sub = _extract_json_array_from_text(output_text)
-#             if json_sub:
-#                 try:
-#                     flags = json.loads(json_sub)
-#                     if not isinstance(flags, list):
-#                         flags = []
-#                 except Exception as e:
-#                     logging.error(f"Failed to parse extracted JSON substring: {e}. Full output: {output_text[:1000]}")
-#                     flags = []
-#             else:
-#                 logging.error(f"LLM output did not contain JSON array. Output head: {output_text[:500]}")
-#                 flags = []
-
-#     except Exception as e:
-#         logging.error(f"LLM call or parsing failed: {e}")
-#         flags = []
-
-#     # annotate with metadata safely
-#     safe_flags = []
-#     for f in flags:
-#         if not isinstance(f, dict):
-#             continue
-#         f.setdefault('section_title', section.get('title'))
-#         f.setdefault('metadata', section.get('metadata', {}))
-#         # ensure keys exist and cast confidence to float between 0 and 1
-#         f.setdefault('issue', '')
-#         f.setdefault('evidence', '')
-#         f.setdefault('reg_ref', '')
-#         f.setdefault('severity', 'medium')
-#         try:
-#             f['confidence'] = float(f.get('confidence', 0.5))
-#             if f['confidence'] < 0: f['confidence'] = 0.0
-#             if f['confidence'] > 1: f['confidence'] = 1.0
-#         except Exception:
-#             f['confidence'] = 0.5
-#         safe_flags.append(f)
-
-#     return safe_flags
-
-
 
 def check_file_compliance(project_desc: str, project_pdf_path: str):
     """
@@ -1280,11 +1291,21 @@ def check_file_compliance(project_desc: str, project_pdf_path: str):
             continue
 
         try:
-            # Main call (this may call LLM)
-            flags = check_compliance_for_section_with_regex(section)
-            if not isinstance(flags, list):
-                logging.warning(f"check_compliance_for_section_with_regex returned non-list for section {idx} of {project_pdf_path}")
+            # compute RAG regs for this section and call the checker
+            rag_regs = graph_enhanced_retrieval(content)
+            result = check_compliance_for_section_with_regex(section, rag_regs=rag_regs)
+            # result should be dict; get flags safely
+            if isinstance(result, dict):
+                flags = result.get("flags", [])
+            elif isinstance(result, list):
+                flags = result
+            else:
                 flags = []
+
+            if not isinstance(flags, list):
+                logging.warning(f"Unexpected flags type for section {idx} in {project_pdf_path}")
+                flags = []
+
             # annotate each flag with section index/title if not already present
             for f in flags:
                 if isinstance(f, dict):
@@ -1301,8 +1322,8 @@ def check_file_compliance(project_desc: str, project_pdf_path: str):
             section_reports.append(sec_report)
 
         # Optional: memory check after each section (uncomment if desired)
-        # if not check_memory_usage():
-        #     memory_cleanup()
+        if not check_memory_usage():
+            memory_cleanup()
 
     total_flags = len(all_flags)
     processing_time = time.time() - start_total
@@ -1431,7 +1452,7 @@ def ingest_documents():
         logging.error(f"Document folder not found: {knowledge_base_folder}")
         return
     
-    files = [f for f in os.listdir(knowledge_base_folder) if f.endswith(('.txt', '.pdf'))]
+    files = [f for f in os.listdir(knowledge_base_folder) if f.lower().endswith(('.txt', '.pdf', '.md'))]
     if not files:
         logging.warning("No documents found to ingest")
         return
