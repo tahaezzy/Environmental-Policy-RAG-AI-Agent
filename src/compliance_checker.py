@@ -506,8 +506,9 @@ Output PURE JSON list of flags with keys:
             else:
                 flags = []
     except Exception as e:
-        logging.error(f"Regex+AI compliance check failed: {e}")
-        flags = []
+        logging.error(f"Ollama connection failed: {e}")
+        print("\n[ERROR] Ollama is not running. Please start it using:\n   ollama serve\n")
+        return {"flags": [], "facts": {}, "answer": "Ollama not available"}
 
     # normalize flags: ensure list of dicts, coerce textual fields to strings, normalize confidence values
     safe_flags = []

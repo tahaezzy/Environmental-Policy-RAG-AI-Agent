@@ -8,8 +8,12 @@ greenpolicyai/
 ├── src/
 │   ├── __init__.py
 │   ├── config.py
+|   |       └── IMPORTS: os, json, torch, pytesseract, logging, SentenceTransformer, CrossEncoder, Client as OllamaClient, Path, 
+|   |       |            psutil, BM25Okapi, numpy as np, time, datetime, re, fitz, pdfplumber, hashlib, List, Dict, Any, Optional, 
+|   |       |            Tuple, tqdm, gc
 |   |       └── get_system_constants()
-│   ├── utils.py              
+│   ├── utils.py        
+|   |       └── IMPORTS: config.py/*, database.py/cache
 |   |       └── get_text_hash()
 |   |       └── check_memory_usage()
 |   |       └── memory_cleanup()
@@ -56,8 +60,7 @@ greenpolicyai/
 from src.config import *
 from src.utils import *
 from src.database import *
-from src.pdf_processing import extract_pdf_text, split_pdf_into_sections
-from src.compliance_checker import check_file_compliance, check_compliance_for_section_with_regex, check_project_compliance
+from src.compliance_checker import check_file_compliance, check_compliance_for_section_with_regex, check_project_compliance, extract_pdf_text, split_pdf_into_sections
 from src.visualization import visualize_reg_graph, print_compliance_summary_table
 from src.rag import *
 
@@ -160,7 +163,7 @@ def main():
             memory_cleanup()
 
         except Exception as e:
-            logging.error(f"Main loop error: {e}")
+            logging.error(f"Main loop error: ")
             print(f"An error occurred: {e}")
             print("Check logs for details.")
 

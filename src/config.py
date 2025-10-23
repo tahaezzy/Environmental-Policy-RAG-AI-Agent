@@ -95,7 +95,7 @@ TOP_K_DEFAULT = constants['TOP_K']
 THINK_MODE = False
 
 # User Folders
-BASE_DIR = Path(__file__).parent.resolve()
+BASE_DIR = Path(__file__).parent.parent.resolve()
 project_guidelines_folder = str(BASE_DIR / "Project Guidelines Folder")
 compliance_regulations_folder = str(BASE_DIR / "Regulations Folder")
 knowledge_base_folder = str(BASE_DIR / "Knowledge Base Folder")

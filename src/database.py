@@ -1,5 +1,5 @@
 # src/database.py
-from src.config import os, json, np, List, Dict, Any, Optional, Tuple 
+from src.config import os, json, np, List, Dict, Any, Optional, Tuple, logging
 import pickle
 import sqlite3
 
